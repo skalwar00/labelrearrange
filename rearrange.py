@@ -1,13 +1,12 @@
 import streamlit as st
 import io
-import re
 import pypdf
 import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime
 
 # ----------------- 1. CONFIG -----------------
-st.set_page_config(page_title="Flipkart Smart Search", layout="wide", page_icon="📦")
+st.set_page_config(page_title="Flipkart Flash Tool", layout="wide")
 
 @st.cache_resource
 def init_supabase():
@@ -15,102 +14,92 @@ def init_supabase():
 
 supabase = init_supabase()
 
+# ----------------- 2. DATA MAPPING (Cached) -----------------
+@st.cache_data(ttl=600)
+def load_mapping_data(user_id):
+    try:
+        res = supabase.table("sku_mapping").select("portal_sku, master_sku").eq("user_id", user_id).execute()
+        mapping = {str(i['portal_sku']).strip().upper(): str(i['master_sku']).strip().upper() for i in res.data}
+        # Sorting by length descending prevents partial matches (e.g., 'ABC' matching 'ABC-123')
+        skus = sorted(mapping.keys(), key=len, reverse=True)
+        return mapping, skus
+    except:
+        return {}, []
+
+# ----------------- 3. CORE ENGINE (Optimized) -----------------
+def fast_process(file_bytes, mapping, sku_list):
+    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    processed_pages = []
+    
+    for i, page in enumerate(reader.pages):
+        # Speed Tip: Extracting only the first 500 characters covers most labels
+        text = (page.extract_text() or "")[:600].upper()
+        
+        found_sku = "UNKNOWN"
+        for sku in sku_list:
+            if sku in text: # Fast string membership check (faster than regex)
+                found_sku = sku
+                break
+        
+        processed_pages.append({
+            "p_sku": found_sku,
+            "m_sku": mapping.get(found_sku, found_sku),
+            "page_idx": i
+        })
+    
+    return processed_pages, reader
+
+# ----------------- 4. UI -----------------
 if 'user' not in st.session_state:
     st.session_state.user = None
 
-# ----------------- 2. AUTH -----------------
+# Simple Login Logic
 if st.session_state.user is None:
     st.title("🔐 Login")
-    # ... (Purana login code yahan rahega)
+    with st.form("auth"):
+        e, p = st.text_input("Email"), st.text_input("Password", type="password")
+        if st.form_submit_button("Login"):
+            res = supabase.auth.sign_in_with_password({"email": e, "password": p})
+            if res.user: 
+                st.session_state.user = res.user
+                st.rerun()
 else:
-    u_id = st.session_state.user.id
-
-    # ----------------- 3. SMART MAPPING -----------------
-    @st.cache_data(ttl=300)
-    def load_mapping_and_list(user_id):
-        try:
-            res = supabase.table("sku_mapping").select("portal_sku, master_sku").eq("user_id", user_id).execute()
-            # 1. Mapping dictionary (Portal -> Master)
-            mapping = {str(i['portal_sku']).strip().upper(): str(i['master_sku']).strip().upper() for i in res.data}
-            # 2. List of all Portal SKUs (Search karne ke liye)
-            portal_skus_list = list(mapping.keys())
-            # Sabse lambe SKU ko pehle rakhein taaki partial match na ho (e.g., 'ABC-1' vs 'ABC-10')
-            portal_skus_list.sort(key=len, reverse=True) 
-            return mapping, portal_skus_list
-        except:
-            return {}, []
-
-    mapping_dict, db_portal_skus = load_mapping_and_list(u_id)
-
-    # ----------------- 4. SMART SEARCH ENGINE -----------------
-    def smart_process_pdf(file_bytes, mapping, sku_list):
-        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-        extracted_data = []
-        
-        for i, page in enumerate(reader.pages):
-            text = (page.extract_text() or "").upper()
-            found_sku = "UNKNOWN"
-
-            # Database ke har SKU ko PDF text mein check karo
-            for sku in sku_list:
-                # Hum check kar rahe hain ki kya SKU text mein maujood hai
-                # Word boundary (\b) use kiya hai taaki exact match mile
-                if re.search(rf'\b{re.escape(sku)}\b', text):
-                    found_sku = sku
-                    break # Ek baar match mil gaya toh loop stop kar do
-            
-            m_sku = mapping.get(found_sku, found_sku)
-            
-            extracted_data.append({
-                "p_sku": found_sku,
-                "m_sku": m_sku,
-                "page_idx": i
-            })
-            
-        return extracted_data, reader
-
-    # ----------------- 5. UI -----------------
-    st.title("📦 Flipkart Order Processor (Database-Sync Mode)")
+    mapping_dict, portal_skus = load_mapping_data(st.session_state.user.id)
     
-    if not db_portal_skus:
-        st.error("⚠️ Aapke Supabase mein koi SKU nahi mile. Pehle mapping upload karein.")
-    
-    uploaded_file = st.file_uploader("Upload Labels PDF", type="pdf")
+    st.title("⚡ Flipkart Flash Processor")
+    file = st.file_uploader("Upload PDF", type="pdf")
 
-    if uploaded_file and db_portal_skus:
-        file_bytes = uploaded_file.read()
+    if file:
+        file_bytes = file.read()
         
-        with st.spinner("🔍 PDF mein Database SKUs search kar raha hoon..."):
-            all_data, reader = smart_process_pdf(file_bytes, mapping_dict, db_portal_skus)
-            df = pd.DataFrame(all_data)
+        # Phase 1: Analysis (Seconds mein hoga)
+        with st.spinner("Scanning..."):
+            data, reader = fast_process(file_bytes, mapping_dict, portal_skus)
+            df = pd.DataFrame(data)
 
-        # Picklist Summary
-        st.subheader("📋 Picklist (Based on DB Match)")
-        summary = df.groupby('m_sku').size().reset_index(name='Qty')
-        
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.dataframe(summary, use_container_width=True, hide_index=True)
-        with c2:
-            unknowns = len(df[df['p_sku'] == "UNKNOWN"])
-            st.metric("Total Orders", len(df))
-            if unknowns > 0:
-                st.error(f"❌ {unknowns} Labels Database se match nahi huye!")
+        # UI Layout
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.dataframe(df.groupby('m_sku').size().reset_index(name='Qty'), use_container_width=True)
+        with col2:
+            st.metric("Orders", len(df))
 
-        # Processing Button
-        if st.button("🚀 Sort & Crop Labels", use_container_width=True):
-            with st.status("PDF taiyaar ho rahi hai...") as status:
-                df_sorted = df.sort_values(by="m_sku")
-                writer = pypdf.PdfWriter()
-                X, Y, W, H = 187, 461, 218, 358 # Standard Flipkart Crop
+        # Phase 2: Instant Crop & Sort
+        if st.button("🚀 CROP & DOWNLOAD NOW", use_container_width=True):
+            output = io.BytesIO()
+            writer = pypdf.PdfWriter()
+            
+            # Sort pages by Master SKU
+            df_sorted = df.sort_values("m_sku")
+            
+            # Calibration - Flipkart Standard
+            X, Y, W, H = 187, 461, 218, 358 
 
-                for _, row in df_sorted.iterrows():
-                    page = reader.pages[row['page_idx']]
-                    page.mediabox.lower_left = (X, Y)
-                    page.mediabox.upper_right = (X + W, Y + H)
-                    writer.add_page(page)
-
-                output = io.BytesIO()
-                writer.write(output)
-                status.update(label="✅ Success!", state="complete")
-                st.download_button("📥 Download Final PDF", output.getvalue(), "Sorted_Labels.pdf")
+            for _, row in df_sorted.iterrows():
+                page = reader.pages[row['page_idx']]
+                page.mediabox.lower_left = (X, Y)
+                page.mediabox.upper_right = (X + W, Y + H)
+                writer.add_page(page)
+            
+            writer.write(output)
+            st.download_button("📥 Get PDF", output.getvalue(), "Flipkart_Final.pdf", "application/pdf")
