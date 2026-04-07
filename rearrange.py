@@ -35,7 +35,7 @@ if st.session_state.user is None:
                 if res.user:
                     st.session_state.user = res.user
                     st.success(f"Logged in as {res.user.email}")
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error("Login Failed!")
             except Exception as e:
