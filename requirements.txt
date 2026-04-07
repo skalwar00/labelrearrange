@@ -5,3 +5,4 @@ reportlab
 thefuzz
 supabase
 openpyxl
+PyPDF2
