@@ -6,3 +6,4 @@ thefuzz
 supabase
 openpyxl
 PyPDF2
+pypdf
