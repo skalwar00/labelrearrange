@@ -65,7 +65,7 @@ else:
             
             # Pattern 1: Standard Flipkart SKU (FMP/FMC)
             # Pattern 2: Fallback for any alpha-numeric SKU (if FMP logic fails)
-            match = re.search(r'(FM[P|C][A-Z0-9]{8,15})', text)
+            match = re.search(r'1\s+([A-Z0-9-]+\b)\s*\|', text)
             
             p_sku = match.group(0).upper() if match else "NOT_FOUND"
             
