@@ -9,14 +9,26 @@ from datetime import datetime
 # ----------------- 1. CONFIG -----------------
 st.set_page_config(page_title="Flipkart Pro Tool", layout="wide", page_icon="📦")
 
+# Custom CSS for a cleaner look
+st.markdown("""
+    <style>
+    .stDownloadButton { width: 100%; }
+    .stButton { width: 100%; }
+    </style>
+""", unsafe_allow_html=True)
+
 # --- Supabase Setup ---
-try:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(url, key)
-except Exception:
-    st.error("Supabase secrets missing! Check .streamlit/secrets.toml")
-    st.stop()
+@st.cache_resource
+def init_connection():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception as e:
+        st.error("Supabase configuration missing or invalid.")
+        return None
+
+supabase = init_connection()
 
 if 'user' not in st.session_state:
     st.session_state.user = None
@@ -30,32 +42,33 @@ if st.session_state.user is None:
         if st.form_submit_button("Login"):
             try:
                 res = supabase.auth.sign_in_with_password({"email": e, "password": p})
-                if res.user:
-                    st.session_state.user = res.user
-                    st.rerun()
+                st.session_state.user = res.user
+                st.rerun()
             except Exception as ex:
-                st.error(f"Login Failed: {ex}")
+                st.error("Invalid credentials. Please try again.")
 else:
+    # Sidebar Info
     u_id = st.session_state.user.id
-    st.sidebar.success(f"Logged in: {st.session_state.user.email}")
+    st.sidebar.title("User Profile")
+    st.sidebar.info(f"Logged in as: \n{st.session_state.user.email}")
+    
     if st.sidebar.button("Logout"):
         supabase.auth.sign_out()
         st.session_state.user = None
         st.rerun()
 
     # ----------------- 3. DATA MAPPING -----------------
-    @st.cache_data(ttl=60)
+    @st.cache_data(ttl=300) # Increased TTL to 5 mins for better performance
     def load_mapping(user_id):
         try:
             res = supabase.table("sku_mapping").select("portal_sku, master_sku").eq("user_id", user_id).execute()
-            # Normalize keys: PT001-WHITE-3XL format
             return {str(item['portal_sku']).strip().upper(): str(item['master_sku']).strip().upper() for item in res.data} if res.data else {}
-        except:
+        except Exception:
             return {}
 
     mapping_dict = load_mapping(u_id)
 
-    # ----------------- 4. FAST LOGIC ENGINE -----------------
+    # ----------------- 4. LOGIC ENGINE -----------------
     def get_pdf_data(file, mapping):
         reader = PyPDF2.PdfReader(file)
         data = []
@@ -64,17 +77,18 @@ else:
             page = reader.pages[i]
             text = page.extract_text() or ""
             
-            # IMPROVED REGEX: Captures SKU between '1 ' and ' |'
-            # Example: 1 PT001-White-3XL | -> PT001-White-3XL
+            # Robust matching: Look for the quantity '1' followed by SKU before the pipe
             match = re.search(r'1\s+([A-Z0-9._-]+)\s*\|', text)
             
-            p_sku = match.group(1).strip().upper() if match else "SKU_NOT_FOUND"
+            if match:
+                p_sku = match.group(1).strip().upper()
+            else:
+                p_sku = "UNKNOWN_SKU"
             
-            # Use Mapping if available, else show Portal SKU
             m_sku = mapping.get(p_sku, p_sku) 
             
             data.append({
-                "page": page, 
+                "page_obj": page, # Keep the object for cropping
                 "portal_sku": p_sku, 
                 "m_sku": m_sku,
                 "page_no": i + 1
@@ -82,47 +96,48 @@ else:
         return data
 
     # ----------------- 5. UI INTERFACE -----------------
-    st.title("📦 Flipkart Picklist & Label Tool")
+    st.title("📦 Flipkart Order Processor")
     
     uploaded_file = st.file_uploader("Upload Flipkart Labels PDF", type="pdf")
 
     if uploaded_file:
-        # Step 1: Analyze PDF immediately
-        with st.spinner("Fast Scanning PDF..."):
+        with st.spinner("Analyzing PDF..."):
             all_data = get_pdf_data(uploaded_file, mapping_dict)
             df = pd.DataFrame(all_data)
 
         # --- PICKLIST SECTION ---
-        st.subheader("📋 Step 1: Picklist Summary")
+        st.subheader("📋 Step 1: Inventory Picklist")
         if not df.empty:
-            # Create Picklist (Group by Master SKU and count)
-            picklist = df.groupby('m_sku').size().reset_index(name='Quantity')
-            picklist.columns = ['Final SKU Name', 'Qty']
+            # Grouping Logic
+            picklist = df.groupby('m_sku').size().reset_index(name='Qty')
+            picklist.columns = ['Master SKU', 'Quantity']
             
-            col1, col2 = st.columns([1, 1])
-            with col1:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
                 st.dataframe(picklist, hide_index=True, use_container_width=True)
-            
-            with col2:
+            with c2:
                 csv = picklist.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Picklist (CSV)", csv, "picklist.csv", "text/csv", use_container_width=True)
-                st.info(f"Total Orders in PDF: {len(df)}")
+                st.download_button("📥 Download CSV", csv, "picklist.csv", "text/csv")
+            with c3:
+                st.metric("Total Items", len(df))
 
         st.divider()
 
         # --- LABEL PROCESSING SECTION ---
-        st.subheader("✂️ Step 2: Crop & Reorder Labels")
-        if st.button("🚀 Generate Organized PDF", use_container_width=True):
-            with st.status("Processing PDF...") as status:
-                # Sort by Master SKU for easy packing
+        st.subheader("✂️ Step 2: Generate Sorted Labels")
+        st.info("Labels will be cropped to 4x6 size and sorted by Master SKU for faster packing.")
+        
+        if st.button("🚀 Process & Download Sorted PDF"):
+            with st.status("Generating PDF...") as status:
                 df_sorted = df.sort_values(by="m_sku")
-                
                 writer = PyPDF2.PdfWriter()
-                # Label Crop Box
+                
+                # Calibration (Standard Flipkart Label Crop)
+                # These coordinates may vary slightly based on printer thermal settings
                 X, Y, W, H = 187, 461, 218, 358
 
                 for _, row in df_sorted.iterrows():
-                    p = row['page']
+                    p = row['page_obj']
                     p.mediabox.lower_left = (X, Y)
                     p.mediabox.upper_right = (X + W, Y + H)
                     writer.add_page(p)
@@ -131,18 +146,18 @@ else:
                 writer.write(output)
                 output.seek(0)
                 
-                status.update(label="✅ PDF Organized!", state="complete")
+                status.update(label="✅ Ready!", state="complete")
+                
                 st.download_button(
-                    "📥 Download Final Labels", 
+                    "📥 Click to Download Sorted_Labels.pdf", 
                     output, 
-                    f"Sorted_Labels_{datetime.now().strftime('%H%M%S')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True
+                    f"Labels_{datetime.now().strftime('%d%m_%H%M')}.pdf",
+                    mime="application/pdf"
                 )
 
     # Sidebar Mapping Preview
-    with st.sidebar.expander("Your Current SKU Mappings"):
+    with st.sidebar.expander("🔍 View Active Mappings"):
         if mapping_dict:
-            st.json(mapping_dict)
+            st.write(pd.DataFrame(list(mapping_dict.items()), columns=["Portal SKU", "Master SKU"]))
         else:
-            st.write("No mappings found. Sync with Supabase first.")
+            st.warning("No mappings found.")
